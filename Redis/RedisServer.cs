@@ -1,4 +1,4 @@
-﻿using Serilog;
+using Serilog;
 using System.Collections;
 using System.Net.Sockets;
 
@@ -6,223 +6,217 @@ namespace codecrafters_redis.src
 {
     public class RedisServer
     {
+        // Haupt-Key-Value-Store – speichert alle SET/GET-Werte sowie Listen.
+        // Werte mit TTL werden als Tuple<object, DateTime> gespeichert, wobei
+        // DateTime der Ablaufzeitpunkt in UTC ist.
+        private Dictionary<string, object> store = new();
+
+        // Für jeden Key eine FIFO-Queue der wartenden BLPOP/BRPOP-Clients.
+        // Wenn ein neues Element in eine Liste gepusht wird, bekommt der erste
+        // wartende Client sofort die Antwort, statt sie in die Liste zu schreiben.
+        private Dictionary<string, Queue<WaitingClient>> queues = new();
+
+        // Lock-Objekt um Race Conditions zwischen HandlePush (Client-Threads)
+        // und CheckQueues (Timer-Thread) auf den queues-Dictionary zu verhindern.
+        private readonly object _queuesLock = new();
+
         private TcpListener listener;
-
-        // Key Value Storage 
-        private Dictionary<object, object> store = new();
-
-        private Dictionary<object, Queue<WaitingClient>> queues = new();
-        private bool isCheckingQueues = false;
         private Timer? _timer;
 
-        public RedisServer(int port)
+        private const int DefaultPort = 6379;
+        private const int timerIntervalMs = 100;
+
+        public RedisServer(int? parameterPort)
         {
+            int port = parameterPort ?? DefaultPort;
+
             this.listener = new(System.Net.IPAddress.Any, port);
 
-            Log.Logger = new LoggerConfiguration()
-                .MinimumLevel.Verbose()
-                .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
-                .CreateLogger();
+            //Log.Logger = new LoggerConfiguration()
+            //    .MinimumLevel.Verbose()
+            //    .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+            //    .CreateLogger();
 
-            Log.Logger.Information("Server start");
+            Log.Logger.Information("RedisServer initialisiert auf Port {Port}", port);
         }
 
         ~RedisServer()
         {
             this._timer?.Dispose();
-            Log.Logger.Information("Server stop");
+            Log.Logger.Information("RedisServer wird beendet, Timer gestoppt");
         }
 
         public void Start()
         {
             this.listener.Start();
-            Log.Logger.Verbose("Redis Server started on port " + ((System.Net.IPEndPoint)this.listener.LocalEndpoint).Port);
-
-            // Fester Intervall ist nicht der richtige Weg
-            this._timer = new(_ => this.CheckQueues(), null, TimeSpan.Zero, TimeSpan.FromMilliseconds(400));
+            Log.Logger.Information("Lausche auf {Endpoint}", (System.Net.IPEndPoint)this.listener.LocalEndpoint);
 
             while (true)
             {
                 var client = this.listener.AcceptSocket();
-                Log.Logger.Information("Client connected: " + client.RemoteEndPoint);
+                Log.Logger.Information("Neuer Client verbunden: {Endpoint}", client.RemoteEndPoint);
+
+                // Jeden Client in einem eigenen Task (Thread-Pool) behandeln,
+                // damit der Haupt-Thread sofort auf den naechsten Client warten kann.
                 Task.Run(() => this.HandleClient(client));
             }
         }
 
-        private void CheckQueues()
-        {
-            if (this.isCheckingQueues)
-            {
-                return;
-            }
-            this.isCheckingQueues = true;
-
-            foreach (var key in this.queues.Keys)
-            {
-                if (this.queues[key] is Queue<WaitingClient> oldqueue)
-                {
-                    if (oldqueue.Count > 0)
-                    {
-                        Queue<WaitingClient> newQueue = new();
-
-                        var now = DateTime.UtcNow;
-
-                        foreach (var item in oldqueue)
-                        {
-                            if (item.ExpireAt is not null && item.ExpireAt < now)
-                            {
-                                Log.Logger.Verbose("Removing expired waiting client: " + item.Socket.RemoteEndPoint);
-                                SendResponse(item.Socket, RESPParser.ToArray(null));
-                            }
-                            else
-                            {
-                                newQueue.Enqueue(item);
-                            }
-                        }
-
-                        this.queues[key] = newQueue;
-                    }
-                }
-            }
-
-            this.isCheckingQueues = false;
-        }
-
+        /// <summary>
+        /// Liest in einer Endlosschleife Befehle vom Client-Socket, parst sie als RESP
+        /// und leitet sie an den zustaendigen Handler weiter.
+        /// Jeder Client laeuft in seinem eigenen Task (siehe Start()).
+        /// </summary>
         private void HandleClient(Socket client)
         {
             while (client.Connected)
             {
                 try
                 {
-                    // Read data from the client
                     byte[] buffer = new byte[1024];
                     int bytesRead = client.Receive(buffer);
-                    if (bytesRead > 0)
+
+                    if (bytesRead == 0)
                     {
-                        string request = System.Text.Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                        // Verbindung wurde vom Client sauber geschlossen
+                        Log.Logger.Information("Client {Endpoint} hat die Verbindung getrennt", client.RemoteEndPoint);
+                        break;
+                    }
 
-                        if (!string.IsNullOrEmpty(request))
-                        {
-                            // Parse the request using RESPParser
-                            var parts = (IEnumerable)RESPParser.Parse(request);
-                            List<string> args = parts.Cast<string>().ToList();
+                    string request = System.Text.Encoding.UTF8.GetString(buffer, 0, bytesRead);
 
-                            var command = args[0].ToLower();
-                            bool success = true;
+                    if (string.IsNullOrEmpty(request))
+                    {
+                        continue;
+                    }
 
-                            switch (command)
-                            {
-                                case "ping":
-                                    HandlePing(client);
-                                    break;
-                                case "echo":
-                                    HandleEcho(client, args);
-                                    break;
-                                case "set":
-                                    this.HandleSet(client, args);
-                                    break;
-                                case "get":
-                                    this.HandleGet(client, args);
-                                    break;
-                                case "rpush":
-                                case "lpush":
-                                    this.HandlePush(client, args);
-                                    break;
-                                case "lrange":
-                                    this.HandleLRange(client, args);
-                                    break;
-                                case "llen":
-                                    this.HandleLLen(client, args);
-                                    break;
-                                case "lpop":
-                                case "rpop":
-                                    this.HandlePop(client, args);
-                                    break;
-                                case "blpop":
-                                case "brpop":
-                                    this.HandleBPop(client, args);
-                                    break;
-                                default:
-                                    success = false;
-                                    HandleError(client, "Unknown command");
-                                    break;
-                            }
+                    // RESP-Protokoll parsen → Liste von Strings (Command + Argumente)
+                    var parts = (IEnumerable)RESPParser.Parse(request);
+                    List<string> args = parts.Cast<string>().ToList();
 
-                            if (success)
-                            {
-                                Log.Logger.Verbose("Handled command: " + command);
-                            }
-                            else
-                            {
-                                Log.Logger.Verbose("Failed to handle command: " + command);
-                            }
-                        }
+                    if (args.Count == 0)
+                    {
+                        Log.Logger.Warning("Leere Anfrage von {Endpoint} erhalten, wird ignoriert", client.RemoteEndPoint);
+                        continue;
+                    }
+
+                    var command = args[0].ToLower();
+                    Log.Logger.Verbose("-> [{Endpoint}] {Command} {Args}",
+                        client.RemoteEndPoint, command.ToUpper(), string.Join(" ", args.Skip(1)));
+
+                    bool success = true;
+
+                    switch (command)
+                    {
+                        case "ping":
+                            HandlePing(client);
+                            break;
+                        case "echo":
+                            HandleEcho(client, args);
+                            break;
+                        case "set":
+                            this.HandleSet(client, args);
+                            break;
+                        case "get":
+                            this.HandleGet(client, args);
+                            break;
+                        case "rpush":
+                        case "lpush":
+                            this.HandlePush(client, args);
+                            break;
+                        case "lrange":
+                            this.HandleLRange(client, args);
+                            break;
+                        case "llen":
+                            this.HandleLLen(client, args);
+                            break;
+                        case "lpop":
+                        case "rpop":
+                            this.HandlePop(client, args);
+                            break;
+                        case "blpop":
+                        case "brpop":
+                            this.HandleBPop(client, args);
+                            break;
+                        case "type":
+                            this.HandleType(client, args);
+                            break;
+                        case "xadd":
+                            this.HandleXAdd(client, args);
+                            break;
+                        default:
+                            success = false;
+                            Log.Logger.Warning("Unbekannter Befehl '{Command}' von {Endpoint}", command, client.RemoteEndPoint);
+                            HandleError(client, $"ERR unknown command '{command}'");
+                            break;
+                    }
+
+                    if (success)
+                    {
+                        Log.Logger.Verbose("<- [{Endpoint}] {Command} erfolgreich verarbeitet", client.RemoteEndPoint, command.ToUpper());
                     }
                 }
-                catch (SocketException ex)
+                catch (SocketException ex) when (ex.ErrorCode == 10054)
                 {
-                    if (ex.ErrorCode == 10054)
-                    {
-                        Log.Logger.Information("Client disconnected: " + client.RemoteEndPoint);
-                    }
+                    // Error 10054 = WSAECONNRESET: Client hat die Verbindung hart getrennt (Windows)
+                    Log.Logger.Information("Client {Endpoint} hat die Verbindung zurueckgesetzt (ECONNRESET)", client.RemoteEndPoint);
+                    break;
                 }
                 catch (Exception ex)
                 {
-                    HandleError(client, "Error handling client: " + ex.Message);
-
+                    Log.Logger.Error(ex, "Unerwarteter Fehler beim Verarbeiten der Anfrage von {Endpoint}", client.RemoteEndPoint);
+                    HandleError(client, $"ERR internal error: {ex.Message}");
                 }
             }
         }
 
         /// <summary>
-        /// Gets the value associated with the specified key, and checks for expiration if the value is a tuple containing an expiration time. If the value has expired, it is removed from the store and null is returned.
+        /// Liest den Wert fuer einen Key aus dem Store.
+        /// Falls der Wert ein Tuple mit Ablaufzeit ist und die Zeit ueberschritten wurde,
+        /// wird der Key automatisch geloescht und null zurueckgegeben (Lazy Expiry).
         /// </summary>
-        /// <param name="key">The key whose value is to be retrieved.</param>
-        /// <returns>The value associated with the specified key, or null if the key does not exist or has expired.</returns>
-        private object? GetValue(object key)
+        private object? GetValue(string key)
         {
-            if (this.store.TryGetValue(key, out var value))
+            if (!this.store.TryGetValue(key, out var value))
             {
-                if (value is Tuple<object, DateTime> tuple)
-                {
-                    if (tuple.Item2 < DateTime.UtcNow)
-                    {
-                        this.store.Remove(key);
-                        return null;
-                    }
-                    else
-                    {
-                        return tuple.Item1;
-                    }
-                }
-                return value;
+                return null;
             }
-            return null;
+
+            if (value is Tuple<string, DateTime> tuple)
+            {
+                if (tuple.Item2 < DateTime.UtcNow)
+                {
+                    // TTL abgelaufen → Key aus dem Store entfernen
+                    Log.Logger.Verbose("Key '{Key}' ist abgelaufen (TTL war {ExpireAt:HH:mm:ss.fff}), wird geloescht", key, tuple.Item2);
+                    this.store.Remove(key);
+                    return null;
+                }
+
+                return tuple.Item1;
+            }
+
+            return value;
         }
 
-        private Queue<WaitingClient>? GetQueue(object key)
+        /// <summary>
+        /// Gibt die Warteschlange der blockierenden Clients fuer einen Key zurueck,
+        /// oder null wenn keine vorhanden.
+        /// </summary>
+        private Queue<WaitingClient>? GetQueue(string key)
         {
-            if (this.queues.TryGetValue(key, out var queue))
-            {
-                return queue;
-            }
-
-            return null;
+            this.queues.TryGetValue(key, out var queue);
+            return queue;
         }
 
-        private void SetValue(object key, object value)
+        /// <summary>
+        /// Schreibt einen Wert in den Store. Ueberschreibt vorhandene Werte.
+        /// </summary>
+        private void SetValue(string key, object value)
         {
-            if (this.store.ContainsKey(key))
-            {
-                this.store[key] = value;
-            }
-            else
-            {
-                if (this.store.TryAdd(key, value) == false)
-                {
-                    throw new Exception("Failed to add value to the store");
-                }
-            }
+            bool isUpdate = this.store.ContainsKey(key);
+            this.store[key] = value;
+
+            Log.Logger.Verbose("Store: Key '{Key}' {Action}", key, isUpdate ? "aktualisiert" : "neu gesetzt");
         }
 
         private static void SendResponse(Socket client, string response)
@@ -230,6 +224,14 @@ namespace codecrafters_redis.src
             client.Send(System.Text.Encoding.UTF8.GetBytes(response));
         }
 
+        private static void HandleError(Socket client, string message)
+        {
+            Log.Logger.Error("Fehler an Client {Endpoint}: {Message}", client.RemoteEndPoint, message);
+            SendResponse(client, RESPParser.ToError(message));
+        }
+
+        // ─── Command Handler ──────────────────────────────────────────────────────
+        #region Commands
         private static void HandlePing(Socket client)
         {
             SendResponse(client, "+PONG\r\n");
@@ -237,251 +239,275 @@ namespace codecrafters_redis.src
 
         private static void HandleEcho(Socket client, List<string> args)
         {
-            SendResponse(client, RESPParser.ToBulkString(string.Join(' ', args.Skip(1))));
+            var message = string.Join(' ', args.Skip(1));
+            SendResponse(client, RESPParser.ToBulkString(message));
         }
 
+        /// <summary>
+        /// SET key value [PX milliseconds]
+        /// Speichert einen Wert, optional mit Ablaufzeit in Millisekunden.
+        /// </summary>
         private void HandleSet(Socket client, List<string> args)
         {
-            object key = args[1];
+            string key = args[1];
             object value = args[2];
 
-            try
+            // Optionale Parameter auswerten (PX = Ablaufzeit in Millisekunden)
+            if (args.Count >= 5)
             {
                 var parameter = args[3];
                 var parameterValue = args[4];
 
                 if (string.Equals(parameter, "px", StringComparison.OrdinalIgnoreCase))
                 {
-                    value = new Tuple<object, DateTime>(value, DateTime.UtcNow.AddMilliseconds(int.Parse(parameterValue)));
+                    int ttlMs = int.Parse(parameterValue);
+                    var expiresAt = DateTime.UtcNow.AddMilliseconds(ttlMs);
+                    value = new Tuple<string, DateTime>(value.ToString()!, (DateTime)expiresAt);
+                    this.SetValue(key, value);
+                    Log.Logger.Verbose("SET '{Key}' mit TTL {Ttl}ms (laeuft ab um {ExpiresAt:HH:mm:ss.fff})", key, ttlMs, expiresAt);
                 }
                 else
                 {
-                    throw new NotImplementedException();
+                    Log.Logger.Warning("SET: Unbekannter Parameter '{Param}', wird ignoriert", parameter);
                 }
-
             }
-            catch (Exception)
+            else
             {
-                // nothing to do, parameter is optional
+                // Set speichert immer einen String-Wert, auch wenn die Eingabe z.B. eine Zahl ist (Redis-Verhalten).
+                this.SetValue(key, value.ToString()!);
             }
-
-            this.SetValue(key, value);
-
-            //if (this.store.ContainsKey(key))
-            //{
-            //    this.store[key] = value;
-            //}
-            //else
-            //{
-            //    if (this.store.TryAdd(key, value) == false)
-            //    {
-            //        throw new NotImplementedException();
-            //    }
-            //}
 
             SendResponse(client, RESPParser.ToSimpleString("OK"));
         }
 
+        /// <summary>
+        /// GET key
+        /// Gibt den Wert eines Keys zurueck, oder Null-Bulk-String wenn nicht vorhanden/abgelaufen.
+        /// </summary>
         private void HandleGet(Socket client, List<string> args)
         {
-            object key = args[1];
-
+            string key = args[1];
             var value = this.GetValue(key);
+
+            if (value is null)
+            {
+                Log.Logger.Verbose("GET '{Key}': nicht gefunden oder abgelaufen", key);
+            }
+            else
+            {
+                Log.Logger.Verbose("GET '{Key}': gefunden -> '{Value}'", key, value);
+            }
 
             SendResponse(client, RESPParser.ToBulkString(value?.ToString()));
         }
 
+        /// <summary>
+        /// LPUSH key value [value ...] / RPUSH key value [value ...]
+        /// Fuegt ein oder mehrere Elemente an den Anfang (L) oder das Ende (R) einer Liste ein.
+        ///
+        /// Wichtig: Bevor Elemente in die Liste geschrieben werden, wird geprueft ob wartende
+        /// BLPOP/BRPOP-Clients fuer diesen Key vorhanden sind. Diese bekommen das Element direkt,
+        /// ohne dass es in die Liste gelangt (FIFO-Fairness wie bei echtem Redis).
+        /// </summary>
         private void HandlePush(Socket client, List<string> args)
         {
             string command = args[0];
-            object key = args[1];
-            var value = this.GetValue(args[1]);
+            string key = args[1];
+            var value = this.GetValue(key);
 
+            // Liste anlegen falls der Key noch nicht existiert
             value ??= new List<string>();
 
-            if (value is List<string> list)
+            if (value is not List<string> list)
             {
-                args.RemoveAt(0); // remove command
-                args.RemoveAt(0); // remove listname
+                Log.Logger.Warning("{Command}: Key '{Key}' existiert, ist aber keine Liste (Typ: {Type})", command, key, value.GetType().Name);
+                SendResponse(client, RESPParser.ToError("WRONGTYPE Operation against a key holding the wrong kind of value"));
+                return;
+            }
 
+            // Command und Key aus args entfernen, damit nur noch die Werte uebrig sind
+            args.RemoveAt(0);
+            args.RemoveAt(0);
 
-                var queue = this.GetQueue(key);
+            var queue = this.GetQueue(key);
+            int directlyServed = 0;
 
-                // wait until the queue is not being checked by the timer
-                while (this.isCheckingQueues) { }
-
-                this.isCheckingQueues = true;
-
-                int wouldhaveadded = 0;
+            lock (this._queuesLock)
+            {
+                // Solange wartende Clients UND noch Werte zum Pushen vorhanden sind:
+                // Clients direkt bedienen statt in die Liste zu schreiben.
                 while (queue != null && queue.Count > 0 && args.Count > 0)
                 {
                     var waitingClient = queue.Dequeue();
 
-                    if (string.Equals(waitingClient.Command, "BLPop", StringComparison.OrdinalIgnoreCase))
+                    // Wenn TrySetResult fehlschlaegt, wurde der Client bereits bedient (z.B. durch Timeout) -> ignorieren
+                    if (!waitingClient.TCS.TrySetResult("Push"))
                     {
-                        SendResponse(waitingClient.Socket, RESPParser.ToArray(new List<string> { key.ToString(), args[0] }));
-                        Log.Logger.Verbose("Sent value to waiting client [BLPOP]: " + waitingClient.Socket.RemoteEndPoint);
-                        args.RemoveAt(0); // remove the first item from the list, which is now sent to the waiting client
-                    }
-                    else if (string.Equals(waitingClient.Command, "BRPop", StringComparison.OrdinalIgnoreCase))
-                    {
-                        SendResponse(waitingClient.Socket, RESPParser.ToArray(new List<string> { key.ToString(), args[args.Count - 1] }));
-                        Log.Logger.Verbose("Sent value to waiting client [BRPOP]: " + waitingClient.Socket.RemoteEndPoint);
-                        args.RemoveAt(args.Count - 1); // remove the last item from the list, which is now sent to the waiting client
+                        Log.Logger.Debug("TCS bereits abgeschlossen für Client {Endpoint} auf Key '{Key}'", waitingClient.Socket.RemoteEndPoint, key);
+                        continue; // Client hat bereits geantwortet (z.B. durch Timeout) → ignorieren
                     }
 
-                    wouldhaveadded++;
-                }
-
-                this.isCheckingQueues = false;
-
-                if (args.Count > 0)
-                {
-                    if (string.Equals(command, "RPush", StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(waitingClient.Command, "blpop", StringComparison.OrdinalIgnoreCase))
                     {
-                        foreach (var item in args)
-                        {
-                            list.Add(item);
-                        }
+                        // BLPOP wartet auf das erste Element → vorne nehmen
+                        string item = args[0];
+                        args.RemoveAt(0);
+                        SendResponse(waitingClient.Socket, RESPParser.ToArray(new List<string> { key.ToString()!, item }));
+                        Log.Logger.Information(
+                            "BLPOP direkt bedient: Client {Endpoint} bekommt '{Item}' von Key '{Key}'",
+                            waitingClient.Socket.RemoteEndPoint, item, key);
                     }
-                    else if (string.Equals(command, "LPush", StringComparison.OrdinalIgnoreCase))
+                    else if (string.Equals(waitingClient.Command, "brpop", StringComparison.OrdinalIgnoreCase))
                     {
-                        foreach (var item in args)
-                        {
-                            list.Insert(0, item);
-                        }
-                    }
-
-                    this.store[key] = list;
-                }
-
-                SendResponse(client, RESPParser.ToInteger(list.Count + wouldhaveadded));
-            }
-            else
-            {
-                SendResponse(client, RESPParser.ToError("Value is not a list"));
-            }
-        }
-
-        private void HandleLRange(Socket client, List<string> args)
-        {
-            var value = this.GetValue(args[1]);
-
-            if (value is List<string> list)
-            {
-                int start = int.Parse(args[2]);
-                int stop = int.Parse(args[3]);
-                if (start < 0)
-                {
-                    start = list.Count + start;
-                }
-                if (stop < 0)
-                {
-                    stop = list.Count + stop;
-                }
-
-                var result = list.Skip(start).Take(stop - start + 1);
-
-                SendResponse(client, RESPParser.ToArray(result.ToList()));
-            }
-            else
-            {
-                if (value is null)
-                {
-                    SendResponse(client, RESPParser.ToArray(null));
-                }
-                else
-                {
-                    SendResponse(client, RESPParser.ToError("Value is not a list"));
-                }
-            }
-        }
-
-        private void HandleLLen(Socket client, List<string> args)
-        {
-            var value = this.GetValue(args[1]);
-            if (value is List<string> list)
-            {
-                SendResponse(client, RESPParser.ToInteger(list.Count));
-            }
-            else
-            {
-                if (value is null)
-                {
-                    SendResponse(client, RESPParser.ToInteger(0));
-                }
-                else
-                {
-                    SendResponse(client, RESPParser.ToError("Value is not a list"));
-                }
-            }
-        }
-
-        private void HandlePop(Socket client, List<string> args)
-        {
-            string command = args[0];
-            var value = this.GetValue(args[1]);
-
-            if (value is List<string> list)
-            {
-                if (list.Count > 0)
-                {
-                    int count;
-
-                    List<string> result = new();
-
-                    try
-                    {
-                        count = int.Parse(args[2]);
-                    }
-                    catch (Exception)
-                    {
-                        count = 1;
-                    }
-
-                    if (string.Equals(command, "LPop", StringComparison.OrdinalIgnoreCase))
-                    {
-                        result = LPop(list, count);
-                        //while (count > 0 && list.Count > 0)
-                        //{
-                        //    result.Add(list[0]);
-
-                        //    list.RemoveAt(0);
-
-                        //    count--;
-                        //}
-                    }
-                    else if (string.Equals(command, "RPop", StringComparison.OrdinalIgnoreCase))
-                    {
-                        result = RPop(list, count);
-                        //while (count > 0 && list.Count > 0)
-                        //{
-                        //    int lastIndex = list.Count - 1;
-
-                        //    result.Add(list[lastIndex]);
-
-                        //    list.RemoveAt(lastIndex);
-
-                        //    count--;
-                        //}
-                    }
-
-                    if (result.Count == 1)
-                    {
-                        SendResponse(client, RESPParser.ToBulkString(result[0]));
+                        // BRPOP wartet auf das letzte Element → hinten nehmen
+                        string item = args[^1];
+                        args.RemoveAt(args.Count - 1);
+                        SendResponse(waitingClient.Socket, RESPParser.ToArray(new List<string> { key.ToString()!, item }));
+                        Log.Logger.Information(
+                            "BRPOP direkt bedient: Client {Endpoint} bekommt '{Item}' von Key '{Key}'",
+                            waitingClient.Socket.RemoteEndPoint, item, key);
                     }
                     else
                     {
-                        SendResponse(client, RESPParser.ToArray(result.ToList()));
+                        throw new InvalidOperationException($"Unbekannter wartender Befehl '{waitingClient.Command}' für Key '{key}'");
                     }
 
-                    return;
+                    directlyServed++;
                 }
             }
 
-            SendResponse(client, RESPParser.ToBulkString(null));
+            // Uebrige Elemente (die nicht direkt an wartende Clients gingen) in die Liste einfuegen
+            if (args.Count > 0)
+            {
+                if (string.Equals(command, "rpush", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var item in args)
+                    {
+                        list.Add(item);
+                    }
+                }
+                else // lpush
+                {
+                    foreach (var item in args)
+                    {
+                        list.Insert(0, item);
+                    }
+                }
+
+                this.store[key] = list;
+                Log.Logger.Verbose("{Command}: {Count} Element(e) in Liste '{Key}' geschrieben, Listenlänge jetzt {Length}",
+                    command.ToUpper(), args.Count, key, list.Count);
+            }
+
+            if (directlyServed > 0)
+            {
+                Log.Logger.Verbose("{Command} '{Key}': {Served} wartende(r) Client(s) direkt bedient, {Stored} in Liste geschrieben",
+                    command.ToUpper(), key, directlyServed, args.Count);
+            }
+
+            // Redis gibt die Laenge zurueck, die die Liste *haette*, wenn alle Elemente eingefuegt worden waeren
+            SendResponse(client, RESPParser.ToInteger(list.Count + directlyServed));
         }
 
+        /// <summary>
+        /// LRANGE key start stop
+        /// Gibt einen Ausschnitt der Liste zurueck. Negative Indizes zaehlen vom Ende.
+        /// Beispiel: LRANGE mylist 0 -1 gibt die gesamte Liste zurueck.
+        /// </summary>
+        private void HandleLRange(Socket client, List<string> args)
+        {
+            var key = args[1];
+            var value = this.GetValue(key);
+
+            if (value is not List<string> list)
+            {
+                SendResponse(client, value is null
+                    ? RESPParser.ToArray([])
+                    : RESPParser.ToError("WRONGTYPE Operation against a key holding the wrong kind of value"));
+                return;
+            }
+
+            int start = int.Parse(args[2]);
+            int stop = int.Parse(args[3]);
+
+            // Negative Indizes: -1 ist das letzte Element, -2 das vorletzte usw.
+            if (start < 0) start = list.Count + start;
+            if (stop < 0) stop = list.Count + stop;
+
+            var result = list.Skip(start).Take(stop - start + 1).ToList();
+
+            Log.Logger.Verbose("LRANGE '{Key}' [{Start}..{Stop}]: {Count} Element(e) zurueckgegeben", key, start, stop, result.Count);
+            SendResponse(client, RESPParser.ToArray(result));
+        }
+
+        /// <summary>
+        /// LLEN key
+        /// Gibt die Anzahl der Elemente einer Liste zurueck, oder 0 wenn der Key nicht existiert.
+        /// </summary>
+        private void HandleLLen(Socket client, List<string> args)
+        {
+            var key = args[1];
+            var value = this.GetValue(key);
+
+            if (value is List<string> list)
+            {
+                Log.Logger.Verbose("LLEN '{Key}': {Count} Elemente", key, list.Count);
+                SendResponse(client, RESPParser.ToInteger(list.Count));
+            }
+            else if (value is null)
+            {
+                Log.Logger.Verbose("LLEN '{Key}': Key nicht vorhanden, gebe 0 zurueck", key);
+                SendResponse(client, RESPParser.ToInteger(0));
+            }
+            else
+            {
+                SendResponse(client, RESPParser.ToError("WRONGTYPE Operation against a key holding the wrong kind of value"));
+            }
+        }
+
+        /// <summary>
+        /// LPOP key [count] / RPOP key [count]
+        /// Entfernt und gibt count Elemente vom Anfang (L) oder Ende (R) der Liste zurueck.
+        /// Ohne count-Argument wird genau 1 Element als Bulk String zurueckgegeben.
+        /// </summary>
+        private void HandlePop(Socket client, List<string> args)
+        {
+            string command = args[0];
+            var key = args[1];
+            var value = this.GetValue(key);
+
+            if (value is not List<string> list || list.Count == 0)
+            {
+                Log.Logger.Verbose("{Command} '{Key}': Liste leer oder nicht vorhanden -> Null", command.ToUpper(), key);
+                SendResponse(client, RESPParser.ToBulkString(null));
+                return;
+            }
+
+            // count ist optional; fehlt es, wird 1 verwendet
+            int count = args.Count >= 3 && int.TryParse(args[2], out int parsedCount) ? parsedCount : 1;
+
+            List<string> result = string.Equals(command, "lpop", StringComparison.OrdinalIgnoreCase)
+                ? LPop(list, count)
+                : RPop(list, count);
+
+            Log.Logger.Verbose("{Command} '{Key}': {Count} Element(e) entfernt, {Remaining} verbleiben in der Liste",
+                command.ToUpper(), key, result.Count, list.Count);
+
+            // Einzelnes Element als Bulk String, mehrere als Array (Redis-Protokoll)
+            if (result.Count == 1)
+            {
+                SendResponse(client, RESPParser.ToBulkString(result[0]));
+            }
+            else
+            {
+                SendResponse(client, RESPParser.ToArray(result));
+            }
+        }
+
+        /// <summary>
+        /// Entfernt count Elemente vom Anfang der Liste und gibt sie zurueck.
+        /// Modifiziert die uebergebene Liste direkt (in-place).
+        /// </summary>
         private static List<string> LPop(List<string> list, int count)
         {
             List<string> result = new();
@@ -494,6 +520,10 @@ namespace codecrafters_redis.src
             return result;
         }
 
+        /// <summary>
+        /// Entfernt count Elemente vom Ende der Liste und gibt sie zurueck.
+        /// Modifiziert die uebergebene Liste direkt (in-place).
+        /// </summary>
         private static List<string> RPop(List<string> list, int count)
         {
             List<string> result = new();
@@ -507,68 +537,233 @@ namespace codecrafters_redis.src
             return result;
         }
 
+        /// <summary>
+        /// BLPOP key [key ...] timeout / BRPOP key [key ...] timeout
+        ///
+        /// Blockierende Pop-Variante:
+        /// 1. Wenn einer der Keys eine nicht-leere Liste enthaelt, wird sofort geantwortet.
+        /// 2. Sonst wird der Client als "WaitingClient" in die Queue des ersten Keys eingereiht.
+        ///    Die Antwort kommt spaeter entweder von HandlePush (neues Element) oder
+        ///    CheckQueues (Timeout abgelaufen → Null-Antwort).
+        ///
+        /// timeout == 0 bedeutet unbegrenzt warten.
+        /// </summary>
         private void HandleBPop(Socket client, List<string> args)
         {
+            // Syntax: BLPOP key [key ...] timeout  →  Timeout ist immer args[^1]
             var command = args[0];
-            var key = args[1];
-            double timeout = double.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture);
+            double timeout = double.Parse(args[^1], System.Globalization.CultureInfo.InvariantCulture);
+            var keys = args.Skip(1).Take(args.Count - 2).ToList();
 
-            Object? value = this.GetValue(key);
+            Log.Logger.Verbose("{Command} von {Endpoint}: Keys=[{Keys}], Timeout={Timeout}s",
+                command.ToUpper(), client.RemoteEndPoint, string.Join(", ", keys), timeout);
 
-            if (value is null)
+            // Schritt 1: Alle angegebenen Keys der Reihe nach pruefen.
+            // Den ersten Key mit einem verfuegbaren Element sofort bedienen.
+            foreach (var key in keys)
             {
-                this.SetValue(key, new List<string>());
-                value = new List<string>();
-            }
+                var value = this.GetValue(key);
 
-            if (value is List<string> list)
-            {
-                if (list.Count == 0)
+                if (value is List<string> list && list.Count > 0)
                 {
-                    Log.Logger.Verbose("Adding Client to Queue");
+                    string item = string.Equals(command, "blpop", StringComparison.OrdinalIgnoreCase)
+                        ? LPop(list, 1).FirstOrDefault(string.Empty)
+                        : RPop(list, 1).FirstOrDefault(string.Empty);
 
-                    // Add the client to the waiting queue for this key
-                    if (!this.queues.ContainsKey(key))
-                    {
-                        this.queues[key] = new Queue<WaitingClient>();
-                    }
+                    Log.Logger.Information("{Command} '{Key}': sofort bedient -> '{Item}' an {Endpoint}",
+                        command.ToUpper(), key, item, client.RemoteEndPoint);
 
-                    var waitingClient = new WaitingClient
-                    {
-                        Socket = client,
-                        ExpireAt = (timeout == 0) ? null : DateTime.UtcNow.AddSeconds(timeout),
-                        Command = command
-                    };
-                    ((Queue<WaitingClient>)this.queues[key]).Enqueue(waitingClient);
+                    SendResponse(client, RESPParser.ToArray(new List<string> { key, item }));
                     return;
                 }
+            }
 
-                string result = string.Empty;
+            // Schritt 2: Alle Keys sind leer → Client blockierend warten lassen.
+            // Wir registrieren den Client nur auf den ERSTEN Key (Redis-Verhalten:
+            // BLPOP wartet auf den ersten Key in der Reihenfolge, der Daten bekommt).
+            var waitKey = keys[0];
+            DateTime? expireAt = timeout == 0 ? null : DateTime.UtcNow.AddSeconds(timeout);
 
-                if (string.Equals(command, "BLPop", StringComparison.OrdinalIgnoreCase))
+            var waitingClient = new WaitingClient
+            {
+                Socket = client,
+                Command = command,
+                TCS = new TaskCompletionSource<string>()
+            };
+
+            lock (this._queuesLock)
+            {
+                if (!this.queues.ContainsKey(waitKey))
                 {
-                    result = LPop(list, 1).FirstOrDefault(string.Empty);
+                    this.queues[waitKey] = new Queue<WaitingClient>();
                 }
-                else if (string.Equals(command, "BRPop", StringComparison.OrdinalIgnoreCase))
+
+                this.queues[waitKey].Enqueue(waitingClient);
+            }
+
+            if (timeout > 0)
+            {
+                Log.Logger.Information("{Command}: Client {Endpoint} wartet auf Key '{Key}' bis {ExpireAt:HH:mm:ss.fff}",
+                    command.ToUpper(), client.RemoteEndPoint, waitKey, expireAt);
+
+                // Nach ablauf des Timeouts (falls angegeben) wird geprueft, ob der Client noch wartet (TCS.TrySetResult) und ggf. mit Null-Antwort bedient.
+                Task.Run(async () =>
                 {
-                    result = RPop(list, 1).FirstOrDefault(string.Empty);
-                }
+                    await Task.Delay(TimeSpan.FromSeconds(timeout));
 
-                SendResponse(client, RESPParser.ToArray(new List<string> { key, result }));
+                    if (waitingClient.TCS.TrySetResult("Timeout"))
+                    {
+                        SendResponse(waitingClient.Socket, RESPParser.ToArray(null));
 
-                return;
+                        Log.Logger.Information("{Command} Timeout: Client {Endpoint} hat auf Key '{Key}' gewartet, aber kein Element wurde verfuegbar (Timeout abgelaufen)",
+                            command.ToUpper(), waitingClient.Socket.RemoteEndPoint, waitKey);
+                    }
+                });
             }
             else
             {
-                HandleError(client, "Value is not a list");
+                Log.Logger.Information("{Command}: Client {Endpoint} wartet unbegrenzt auf Key '{Key}'",
+                    command.ToUpper(), client.RemoteEndPoint, waitKey);
             }
         }
 
-        private static void HandleError(Socket client, string message)
+        private void HandleType(Socket client, List<string> args)
         {
-            Log.Logger.Error(message);
+            string key = args[1];
+            var value = this.GetValue(key);
 
-            SendResponse(client, RESPParser.ToError(message));
+            string type = value switch
+            {
+                null => "none",
+                List<string> => "list",
+                Stream => "stream",
+                string => "string",
+                _ => "unknown"
+            };
+            Log.Logger.Verbose("TYPE '{Key}': {Type}", key, type);
+            SendResponse(client, RESPParser.ToSimpleString(type));
         }
+
+        private void HandleXAdd(Socket client, List<string> args)
+        {
+            string key = args[1];
+            var value = this.GetValue(key);
+
+            value ??= new Stream();
+
+            if (value is Stream stream)
+            {
+                args.RemoveAt(0); // Command
+                args.RemoveAt(0); // Key
+
+                string nextID;
+
+                // Split Current ID
+                string[] current_id_parts = new string[2];
+                current_id_parts = args[0].Split('-');
+
+                // Prepare for Last ID
+                string[] last_id_parts = new string[2];
+                var last = stream.Values.LastOrDefault();
+                int last_seq = -1;
+
+                if (last is not null)
+                {
+                    last_id_parts = last.Item1.Split('-');
+
+                    if (string.Equals(current_id_parts[0], last_id_parts[0]))
+                    {
+                        last_seq = (last is null) ? 0 : int.Parse(last.Item1.Split('-')[1]);
+                    }
+                }
+
+                bool generated = false;
+
+                if (string.Equals(current_id_parts[0], "*"))
+                {
+                    generated = true;
+                    current_id_parts = new string[2] { DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(), (last_seq + 1).ToString() };
+                }
+                else if (string.Equals(current_id_parts[1], "*"))
+                {
+                    generated = true;
+                    current_id_parts[1] = (last_seq + 1).ToString();
+                }
+
+                if (generated)
+                {
+                    if (string.Equals(current_id_parts[0], "0") && string.Equals(current_id_parts[1], "0"))
+                    {
+                        Log.Logger.Warning("XADD '{Key}': Generierte ID ist 0-0, was nicht erlaubt ist", key);
+                        current_id_parts[1] = "1";
+                    }
+                }
+
+                long current_id = long.Parse(string.Join(null, current_id_parts));
+                long last_id = (last is null) ? -1 : long.Parse(string.Join(null, last_id_parts));
+
+                if (current_id == 0)
+                {
+                    HandleError(client, "ERR The ID specified in XADD must be greater than 0-0");
+                    return;
+                }
+
+                if (current_id <= last_id)
+                {
+                    HandleError(client, "ERR The ID specified in XADD is equal or smaller than the target stream top item");
+                    return;
+                }
+
+
+                //long current_ms = long.Parse(current_id_parts[0] ?? "0");
+                //long last_ms = long.Parse(last_id_parts[0] ?? "0");
+
+                //if (current_ms > 0 && current_ms != last_ms)
+                //{
+                //    current_id_parts[1] = "0";
+                //}
+
+                //int current_seq = int.Parse(current_id_parts[1] ?? "0");
+                //last_seq = int.Parse(last_id_parts[1] ?? "0");
+
+                //if (current_ms == last_ms)
+                //{
+                //    if (current_seq <= last_seq)
+                //    {
+                //        if (current_ms == 0 && current_seq == 0)
+                //        {
+                //            HandleError(client, "ERR The ID specified in XADD must be greater than 0-0");
+                //        }
+                //        else
+                //        {
+                //            HandleError(client, "ERR The ID specified in XADD is equal or smaller than the target stream top item");
+                //        }
+                //        return;
+                //    }
+                //}
+
+                nextID = string.Join('-', current_id_parts);
+
+                for (int i = 1; i < args.Count; i += 2)
+                {
+                    string streamkey = args[i];
+                    object streamvalue = args[i + 1];
+
+                    var entry = new Tuple<string, Dictionary<string, object>>(nextID, new Dictionary<string, object> { { streamkey, streamvalue } });
+                    stream.Values.Add(entry);
+
+                    Log.Logger.Verbose("XADD '{Key}': Neues Stream-Element mit ID '{ID}' hinzugefügt", key, nextID);
+                }
+
+                this.SetValue(key, stream);
+
+                SendResponse(client, RESPParser.ToBulkString(nextID));
+            }
+            else
+            {
+                SendResponse(client, RESPParser.ToError("WRONGTYPE Operation against a key holding the wrong kind of value"));
+            }
+        }
+        #endregion
     }
 }
