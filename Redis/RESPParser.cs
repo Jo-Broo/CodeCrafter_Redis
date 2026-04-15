@@ -29,14 +29,19 @@ namespace codecrafters_redis.src
             return $"-{value}\r\n";
         }
 
-        public static string ToArray(params string[] values)
+        public static string ToArray(List<string>? values)
         {
-            if (values.Length == 0)
+            if (values is null)
+            {
+                return "*-1\r\n";
+            }
+
+            if (values.Count == 0)
             {
                 return "*0\r\n";
             }
 
-            string result = $"*{values.Length}\r\n";
+            string result = $"*{values.Count}\r\n";
             foreach (var value in values)
             {
                 result += ToBulkString(value);

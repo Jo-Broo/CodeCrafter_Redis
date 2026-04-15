@@ -11,6 +11,10 @@ namespace codecrafters_redis.src
         // Key Value Storage 
         private Dictionary<object, object> store = new();
 
+        private Dictionary<object, Queue<WaitingClient>> queues = new();
+        private bool isCheckingQueues = false;
+        private Timer? _timer;
+
         public RedisServer(int port)
         {
             this.listener = new(System.Net.IPAddress.Any, port);
@@ -23,16 +27,65 @@ namespace codecrafters_redis.src
             Log.Logger.Information("Server start");
         }
 
+        ~RedisServer()
+        {
+            this._timer?.Dispose();
+            Log.Logger.Information("Server stop");
+        }
+
         public void Start()
         {
             this.listener.Start();
             Log.Logger.Verbose("Redis Server started on port " + ((System.Net.IPEndPoint)this.listener.LocalEndpoint).Port);
+
+            // Fester Intervall ist nicht der richtige Weg
+            this._timer = new(_ => this.CheckQueues(), null, TimeSpan.Zero, TimeSpan.FromMilliseconds(400));
+
             while (true)
             {
                 var client = this.listener.AcceptSocket();
                 Log.Logger.Information("Client connected: " + client.RemoteEndPoint);
                 Task.Run(() => this.HandleClient(client));
             }
+        }
+
+        private void CheckQueues()
+        {
+            if (this.isCheckingQueues)
+            {
+                return;
+            }
+            this.isCheckingQueues = true;
+
+            foreach (var key in this.queues.Keys)
+            {
+                if (this.queues[key] is Queue<WaitingClient> oldqueue)
+                {
+                    if (oldqueue.Count > 0)
+                    {
+                        Queue<WaitingClient> newQueue = new();
+
+                        var now = DateTime.UtcNow;
+
+                        foreach (var item in oldqueue)
+                        {
+                            if (item.ExpireAt is not null && item.ExpireAt < now)
+                            {
+                                Log.Logger.Verbose("Removing expired waiting client: " + item.Socket.RemoteEndPoint);
+                                SendResponse(item.Socket, RESPParser.ToArray(null));
+                            }
+                            else
+                            {
+                                newQueue.Enqueue(item);
+                            }
+                        }
+
+                        this.queues[key] = newQueue;
+                    }
+                }
+            }
+
+            this.isCheckingQueues = false;
         }
 
         private void HandleClient(Socket client)
@@ -85,7 +138,10 @@ namespace codecrafters_redis.src
                                 case "rpop":
                                     this.HandlePop(client, args);
                                     break;
-
+                                case "blpop":
+                                case "brpop":
+                                    this.HandleBPop(client, args);
+                                    break;
                                 default:
                                     success = false;
                                     HandleError(client, "Unknown command");
@@ -114,20 +170,15 @@ namespace codecrafters_redis.src
                 {
                     HandleError(client, "Error handling client: " + ex.Message);
 
-                    //Log.Logger.Error("Error handling client: " + ex.Message);
                 }
-                //finally
-                //{
-                //    if (client.Connected == false)
-                //    {
-                //        client.Close();
-
-                //        Log.Logger.Information("Client connection closed");
-                //    }
-                //}
             }
         }
 
+        /// <summary>
+        /// Gets the value associated with the specified key, and checks for expiration if the value is a tuple containing an expiration time. If the value has expired, it is removed from the store and null is returned.
+        /// </summary>
+        /// <param name="key">The key whose value is to be retrieved.</param>
+        /// <returns>The value associated with the specified key, or null if the key does not exist or has expired.</returns>
         private object? GetValue(object key)
         {
             if (this.store.TryGetValue(key, out var value))
@@ -147,6 +198,31 @@ namespace codecrafters_redis.src
                 return value;
             }
             return null;
+        }
+
+        private Queue<WaitingClient>? GetQueue(object key)
+        {
+            if (this.queues.TryGetValue(key, out var queue))
+            {
+                return queue;
+            }
+
+            return null;
+        }
+
+        private void SetValue(object key, object value)
+        {
+            if (this.store.ContainsKey(key))
+            {
+                this.store[key] = value;
+            }
+            else
+            {
+                if (this.store.TryAdd(key, value) == false)
+                {
+                    throw new Exception("Failed to add value to the store");
+                }
+            }
         }
 
         private static void SendResponse(Socket client, string response)
@@ -189,17 +265,19 @@ namespace codecrafters_redis.src
                 // nothing to do, parameter is optional
             }
 
-            if (this.store.ContainsKey(key))
-            {
-                this.store[key] = value;
-            }
-            else
-            {
-                if (this.store.TryAdd(key, value) == false)
-                {
-                    throw new NotImplementedException();
-                }
-            }
+            this.SetValue(key, value);
+
+            //if (this.store.ContainsKey(key))
+            //{
+            //    this.store[key] = value;
+            //}
+            //else
+            //{
+            //    if (this.store.TryAdd(key, value) == false)
+            //    {
+            //        throw new NotImplementedException();
+            //    }
+            //}
 
             SendResponse(client, RESPParser.ToSimpleString("OK"));
         }
@@ -226,24 +304,58 @@ namespace codecrafters_redis.src
                 args.RemoveAt(0); // remove command
                 args.RemoveAt(0); // remove listname
 
-                if (string.Equals(command, "RPush", StringComparison.OrdinalIgnoreCase))
+
+                var queue = this.GetQueue(key);
+
+                // wait until the queue is not being checked by the timer
+                while (this.isCheckingQueues) { }
+
+                this.isCheckingQueues = true;
+
+                int wouldhaveadded = 0;
+                while (queue != null && queue.Count > 0 && args.Count > 0)
                 {
-                    foreach (var item in args)
+                    var waitingClient = queue.Dequeue();
+
+                    if (string.Equals(waitingClient.Command, "BLPop", StringComparison.OrdinalIgnoreCase))
                     {
-                        list.Add(item);
+                        SendResponse(waitingClient.Socket, RESPParser.ToArray(new List<string> { key.ToString(), args[0] }));
+                        Log.Logger.Verbose("Sent value to waiting client [BLPOP]: " + waitingClient.Socket.RemoteEndPoint);
+                        args.RemoveAt(0); // remove the first item from the list, which is now sent to the waiting client
                     }
-                }
-                else if (string.Equals(command, "LPush", StringComparison.OrdinalIgnoreCase))
-                {
-                    foreach (var item in args)
+                    else if (string.Equals(waitingClient.Command, "BRPop", StringComparison.OrdinalIgnoreCase))
                     {
-                        list.Insert(0, item);
+                        SendResponse(waitingClient.Socket, RESPParser.ToArray(new List<string> { key.ToString(), args[args.Count - 1] }));
+                        Log.Logger.Verbose("Sent value to waiting client [BRPOP]: " + waitingClient.Socket.RemoteEndPoint);
+                        args.RemoveAt(args.Count - 1); // remove the last item from the list, which is now sent to the waiting client
                     }
+
+                    wouldhaveadded++;
                 }
 
-                this.store[key] = list;
+                this.isCheckingQueues = false;
 
-                SendResponse(client, RESPParser.ToInteger(list.Count));
+                if (args.Count > 0)
+                {
+                    if (string.Equals(command, "RPush", StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (var item in args)
+                        {
+                            list.Add(item);
+                        }
+                    }
+                    else if (string.Equals(command, "LPush", StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (var item in args)
+                        {
+                            list.Insert(0, item);
+                        }
+                    }
+
+                    this.store[key] = list;
+                }
+
+                SendResponse(client, RESPParser.ToInteger(list.Count + wouldhaveadded));
             }
             else
             {
@@ -268,15 +380,15 @@ namespace codecrafters_redis.src
                     stop = list.Count + stop;
                 }
 
-                var result = list.Skip(start).Take(stop - start + 1).ToArray();
+                var result = list.Skip(start).Take(stop - start + 1);
 
-                SendResponse(client, RESPParser.ToArray(result));
+                SendResponse(client, RESPParser.ToArray(result.ToList()));
             }
             else
             {
                 if (value is null)
                 {
-                    SendResponse(client, RESPParser.ToArray());
+                    SendResponse(client, RESPParser.ToArray(null));
                 }
                 else
                 {
@@ -329,27 +441,29 @@ namespace codecrafters_redis.src
 
                     if (string.Equals(command, "LPop", StringComparison.OrdinalIgnoreCase))
                     {
-                        while (count > 0 && list.Count > 0)
-                        {
-                            result.Add(list[0]);
+                        result = LPop(list, count);
+                        //while (count > 0 && list.Count > 0)
+                        //{
+                        //    result.Add(list[0]);
 
-                            list.RemoveAt(0);
+                        //    list.RemoveAt(0);
 
-                            count--;
-                        }
+                        //    count--;
+                        //}
                     }
                     else if (string.Equals(command, "RPop", StringComparison.OrdinalIgnoreCase))
                     {
-                        while (count > 0 && list.Count > 0)
-                        {
-                            int lastIndex = list.Count - 1;
+                        result = RPop(list, count);
+                        //while (count > 0 && list.Count > 0)
+                        //{
+                        //    int lastIndex = list.Count - 1;
 
-                            result.Add(list[lastIndex]);
+                        //    result.Add(list[lastIndex]);
 
-                            list.RemoveAt(lastIndex);
+                        //    list.RemoveAt(lastIndex);
 
-                            count--;
-                        }
+                        //    count--;
+                        //}
                     }
 
                     if (result.Count == 1)
@@ -358,7 +472,7 @@ namespace codecrafters_redis.src
                     }
                     else
                     {
-                        SendResponse(client, RESPParser.ToArray(result.ToArray()));
+                        SendResponse(client, RESPParser.ToArray(result.ToList()));
                     }
 
                     return;
@@ -368,11 +482,88 @@ namespace codecrafters_redis.src
             SendResponse(client, RESPParser.ToBulkString(null));
         }
 
-        private void HandleBLPop(Socket client, List<string> args)
+        private static List<string> LPop(List<string> list, int count)
         {
-            // Not implemented, as it requires blocking behavior which is more complex to handle in this simple server
-            SendResponse(client, RESPParser.ToError("BLPop is not implemented"));
+            List<string> result = new();
+            while (count > 0 && list.Count > 0)
+            {
+                result.Add(list[0]);
+                list.RemoveAt(0);
+                count--;
+            }
+            return result;
         }
+
+        private static List<string> RPop(List<string> list, int count)
+        {
+            List<string> result = new();
+            while (count > 0 && list.Count > 0)
+            {
+                int lastIndex = list.Count - 1;
+                result.Add(list[lastIndex]);
+                list.RemoveAt(lastIndex);
+                count--;
+            }
+            return result;
+        }
+
+        private void HandleBPop(Socket client, List<string> args)
+        {
+            var command = args[0];
+            var key = args[1];
+            double timeout = double.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture);
+
+            Object? value = this.GetValue(key);
+
+            if (value is null)
+            {
+                this.SetValue(key, new List<string>());
+                value = new List<string>();
+            }
+
+            if (value is List<string> list)
+            {
+                if (list.Count == 0)
+                {
+                    Log.Logger.Verbose("Adding Client to Queue");
+
+                    // Add the client to the waiting queue for this key
+                    if (!this.queues.ContainsKey(key))
+                    {
+                        this.queues[key] = new Queue<WaitingClient>();
+                    }
+
+                    var waitingClient = new WaitingClient
+                    {
+                        Socket = client,
+                        ExpireAt = (timeout == 0) ? null : DateTime.UtcNow.AddSeconds(timeout),
+                        Command = command
+                    };
+                    ((Queue<WaitingClient>)this.queues[key]).Enqueue(waitingClient);
+                    return;
+                }
+
+                string result = string.Empty;
+
+                if (string.Equals(command, "BLPop", StringComparison.OrdinalIgnoreCase))
+                {
+                    result = LPop(list, 1).FirstOrDefault(string.Empty);
+                }
+                else if (string.Equals(command, "BRPop", StringComparison.OrdinalIgnoreCase))
+                {
+                    result = RPop(list, 1).FirstOrDefault(string.Empty);
+                }
+
+                SendResponse(client, RESPParser.ToArray(new List<string> { key, result }));
+
+                return;
+            }
+            else
+            {
+                HandleError(client, "Value is not a list");
+            }
+        }
+
         private static void HandleError(Socket client, string message)
         {
             Log.Logger.Error(message);
